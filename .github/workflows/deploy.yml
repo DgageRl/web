@@ -1,84 +1,130 @@
-name: Blue-Green Deploy
+name: Blue-Green Auto Deploy
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:  # Кнопка "Run workflow" для ручного запуска
-    inputs:           # ← inputs должны быть здесь!
-      target_env:
-        description: 'Окружение для деплоя (blue/green)'
-        required: true
-        default: 'green'
-        type: choice
-        options:
-          - blue
-          - green
-
+  workflow_dispatch:  # Оставляем кнопку для ручного запуска, но выбор окружения не нужен
 
 jobs:
-  # 1. СБОРКА САЙТА
   build:
-    runs-on: [self-hosted, local]
+    runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build
-        shell: bash
+      - name: Prepare Artifact
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp -r src/* dist/
-          sed -i "s/__VERSION__/${GITHUB_RUN_NUMBER}/g" dist/index.html
-          sed -i "s/__ENV__/${DEPLOY_TARGET:-green}/g" dist/index.html
-          sed -i "s/__BUILD_TIME__/$(date -u +'%Y-%m-%d %H:%M:%S UTC')/g" dist/index.html
+          # Создаем папку для сборки, если нет
+          New-Item -ItemType Directory -Force -Path .build | Out-Null
+          
+          # Копируем исходники сайта
+          Copy-Item -Path "src\*" -Destination ".build\" -Recurse -Force
+          
+          # Подставляем переменные в HTML (Версия, Время)
+          $htmlPath = ".build\index.html"
+          if (Test-Path $htmlPath) {
+              $content = Get-Content $htmlPath -Raw
+              $content = $content -replace '__VERSION__', "${env:GITHUB_RUN_NUMBER}"
+              $content = $content -replace '__BUILD_TIME__', (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss") + " UTC"
+              Set-Content -Path $htmlPath -Value $content
+          }
 
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: site-dist
-          path: dist/
+          name: site-build
+          path: .build/
 
-  # 2. ДЕПЛОЙ В ЦЕЛЕВОЕ ОКРУЖЕНИЕ (ручной запуск)
   deploy:
     needs: build
-    if: github.event_name == 'workflow_dispatch'  # Только при ручном запуске
-    runs-on: [self-hosted, local]
+    runs-on: self-hosted
     steps:
-      - name: Download artifact
+      - uses: actions/checkout@v4
+
+      - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          name: site-dist
-          path: dist/
+          name: site-build
+          path: .build/
 
-      - name: Deploy to ${{ inputs.target_env || 'green' }}
-        shell: bash
+      - name: Determine Target Environment & Deploy
+        shell: pwsh
         run: |
-          # Определяем целевую среду (по умолчанию green)
-          TARGET_ENV="${{ inputs.target_env || 'green' }}"
-          bash scripts/deploy.sh dist "$TARGET_ENV"
+          # 1. Читаем текущий активный контейнер из конфига Nginx
+          $nginxConfPath = ".\nginx\upstream.conf"
+          $confContent = Get-Content $nginxConfPath -Raw
+          
+          if ($confContent -match "site_blue") {
+              $activeEnv = "blue"
+              $targetEnv = "green"
+          } else {
+              $activeEnv = "green"
+              $targetEnv = "blue"
+          }
+          
+          Write-Host "Active environment: $activeEnv"
+          Write-Host "Deploying to target environment: $targetEnv"
 
-  # 3. ПРОВЕРКА (Smoke Test)
-  verify:
-    needs: deploy
-    runs-on: [self-hosted, local]
-    steps:
-      - name: Verify new version
-        shell: bash
+          # 2. Копируем файлы сборки в папку целевого Docker-контекста
+          # В вашем docker-compose.yml контекст для сборки - это корень проекта, 
+          # а Dockerfile копирует из ./src. Следовательно, нужно обновить ./src
+          Remove-Item -Path "src\*" -Recurse -Force
+          Copy-Item -Path ".build\*" -Destination "src\" -Recurse -Force
+
+          # 3. Пересобираем и перезапускаем ТОЛЬКО целевой контейнер
+          # Важно: используем --no-deps, чтобы не трогать nginx и активный контейнер
+          Write-Host "Building and starting site_$targetEnv..."
+          docker compose up -d --build --no-deps "site_$targetEnv"
+
+      - name: Verify Target Environment
+        shell: pwsh
         run: |
-          TARGET_ENV="${{ inputs.target_env || 'green' }}"
-          # Проверяем, что файл содержит номер сборки
-          grep -q "${GITHUB_RUN_NUMBER}" "C:/www/${TARGET_ENV}/index.html"
-          echo "✓ Версия совпадает"
+          # Определяем target по аналогии с предыдущим шагом (или можно передать через output)
+          # Для простоты повторим логику чтения конфига
+          $confContent = Get-Content ".\nginx\upstream.conf" -Raw
+          if ($confContent -match "site_blue") { $targetEnv = "green" } else { $targetEnv = "blue" }
 
-  # 4. ПЕРЕКЛЮЧЕНИЕ ТРАФИКА (ручной запуск)
+          Write-Host "Verifying site_$targetEnv..."
+          
+          # Проверяем, что контейнер запущен и внутри есть наш файл
+          $containerName = "site_$targetEnv"
+          $result = docker exec $containerName cat /usr/share/nginx/html/index.html
+          
+          if ($result -match "${env:GITHUB_RUN_NUMBER}") {
+              Write-Host "Verification passed: Version ${env:GITHUB_RUN_NUMBER} found."
+          } else {
+              Write-Error "Verification failed: Version mismatch."
+              exit 1
+          }
+
   switch:
-    needs: verify
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, local]
+    needs: deploy
+    runs-on: self-hosted
     steps:
-      - name: Switch traffic
-        shell: bash
+      - uses: actions/checkout@v4
+
+      - name: Switch Traffic
+        shell: pwsh
         run: |
-          TARGET_ENV="${{ inputs.target_env || 'green' }}"
-          bash scripts/switch.sh "$TARGET_ENV"
-#
+          # 1. Определяем целевое окружение
+          $confContent = Get-Content ".\nginx\upstream.conf" -Raw
+          if ($confContent -match "site_blue") { $targetEnv = "green" } else { $targetEnv = "blue" }
+          
+          Write-Host "Switching traffic to site_$targetEnv..."
+
+          # 2. Обновляем upstream.conf
+          "upstream site_pool { server site_${targetEnv}:80; }" | Set-Content -Path ".\nginx\upstream.conf"
+
+          # 3. Копируем обновленный конфиг в контейнер nginx и перезагружаем
+          # Предполагаем, что имя контейнера nginx - nginx_proxy (как в вашем compose)
+          docker cp .\nginx\upstream.conf nginx_proxy:/etc/nginx/upstream.conf
+          
+          # Проверка синтаксиса и graceful reload
+          docker exec nginx_proxy nginx -t
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Nginx config test failed"
+              exit 1
+          }
+          
+          docker exec nginx_proxy nginx -s reload
+          Write-Host "Traffic successfully switched to $targetEnv."
