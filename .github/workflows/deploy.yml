@@ -4,6 +4,16 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:  # Кнопка "Run workflow" для ручного запуска
+    inputs:           # ← inputs должны быть здесь!
+      target_env:
+        description: 'Окружение для деплоя (blue/green)'
+        required: true
+        default: 'green'
+        type: choice
+        options:
+          - blue
+          - green
+
 
 jobs:
   # 1. СБОРКА САЙТА
@@ -71,14 +81,3 @@ jobs:
         run: |
           TARGET_ENV="${{ inputs.target_env || 'green' }}"
           bash scripts/switch.sh "$TARGET_ENV"
-
-# Входные параметры для ручного запуска
-inputs:
-  target_env:
-    description: 'Окружение для деплоя (blue/green)'
-    required: true
-    default: 'green'
-    type: choice
-    options:
-      - blue
-      - green
