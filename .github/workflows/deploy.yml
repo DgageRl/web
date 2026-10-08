@@ -1,0 +1,84 @@
+name: Blue-Green Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Кнопка "Run workflow" для ручного запуска
+
+jobs:
+  # 1. СБОРКА САЙТА
+  build:
+    runs-on: [self-hosted, local]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -r src/* dist/
+          sed -i "s/__VERSION__/${GITHUB_RUN_NUMBER}/g" dist/index.html
+          sed -i "s/__ENV__/${DEPLOY_TARGET:-green}/g" dist/index.html
+          sed -i "s/__BUILD_TIME__/$(date -u +'%Y-%m-%d %H:%M:%S UTC')/g" dist/index.html
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-dist
+          path: dist/
+
+  # 2. ДЕПЛОЙ В ЦЕЛЕВОЕ ОКРУЖЕНИЕ (ручной запуск)
+  deploy:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'  # Только при ручном запуске
+    runs-on: [self-hosted, local]
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: site-dist
+          path: dist/
+
+      - name: Deploy to ${{ inputs.target_env || 'green' }}
+        shell: bash
+        run: |
+          # Определяем целевую среду (по умолчанию green)
+          TARGET_ENV="${{ inputs.target_env || 'green' }}"
+          bash scripts/deploy.sh dist "$TARGET_ENV"
+
+  # 3. ПРОВЕРКА (Smoke Test)
+  verify:
+    needs: deploy
+    runs-on: [self-hosted, local]
+    steps:
+      - name: Verify new version
+        shell: bash
+        run: |
+          TARGET_ENV="${{ inputs.target_env || 'green' }}"
+          # Проверяем, что файл содержит номер сборки
+          grep -q "${GITHUB_RUN_NUMBER}" "C:/www/${TARGET_ENV}/index.html"
+          echo "✓ Версия совпадает"
+
+  # 4. ПЕРЕКЛЮЧЕНИЕ ТРАФИКА (ручной запуск)
+  switch:
+    needs: verify
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, local]
+    steps:
+      - name: Switch traffic
+        shell: bash
+        run: |
+          TARGET_ENV="${{ inputs.target_env || 'green' }}"
+          bash scripts/switch.sh "$TARGET_ENV"
+
+# Входные параметры для ручного запуска
+inputs:
+  target_env:
+    description: 'Окружение для деплоя (blue/green)'
+    required: true
+    default: 'green'
+    type: choice
+    options:
+      - blue
+      - green
