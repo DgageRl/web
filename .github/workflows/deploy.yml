@@ -81,3 +81,4 @@ jobs:
         run: |
           TARGET_ENV="${{ inputs.target_env || 'green' }}"
           bash scripts/switch.sh "$TARGET_ENV"
+#
